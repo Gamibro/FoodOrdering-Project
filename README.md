@@ -8,7 +8,7 @@
 [![Barcode](https://img.shields.io/badge/Barcode_Scanner-222222?style=for-the-badge&logo=zebra&logoColor=white)]()
 
 > ⚠️ **Note:** This repository contains the **React frontend** of the Food Ordering System.
-> The backend is built with **C# ASP.NET MVC** and is maintained in a separate repository.
+> The backend is built with **C# ASP.NET MVC** .
 
 </div>
 
