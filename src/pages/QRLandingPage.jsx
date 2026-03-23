@@ -1,0 +1,514 @@
+import React, { useEffect, useState, useRef } from "react";
+import jsQR from "jsqr";
+import { useNavigate } from "react-router-dom";
+import { QrCode, AlertCircle } from "lucide-react";
+import { sessionManager } from "../utils/sessionManager";
+import { orderService } from "../services/order_user";
+import { orderService as adminOrdersService } from "../services/orderService";
+import Header from "../components/Header";
+
+const QRLandingPage = () => {
+  const navigate = useNavigate();
+  const [error, setError] = useState(null);
+  const [status, setStatus] = useState("Initializing...");
+  const [manualId, setManualId] = useState("");
+  const [manualLoading, setManualLoading] = useState(false);
+  const [detectedId, setDetectedId] = useState(null);
+  const [needAction, setNeedAction] = useState(false);
+  const [showScanner, setShowScanner] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanMessage, setScanMessage] = useState(null);
+  const videoRef = useRef(null);
+  const scanInterval = useRef(null);
+  const [facingMode, setFacingMode] = useState('environment');
+
+  // Expose URL parsing so we can show/debug detected id in UI
+  const getTableIdFromUrl = () => {
+    const href = window.location.href || "";
+
+    // 1) standard search params
+    const searchParams = new URLSearchParams(window.location.search);
+    let t = searchParams.get("id") || searchParams.get("tableId") || searchParams.get("table");
+    if (t) return t;
+
+    // 2) hash-based routing where query is after '#'
+    const hash = window.location.hash || "";
+    const qm = hash.indexOf("?");
+    if (qm !== -1) {
+      const hashQuery = hash.substring(qm);
+      const hashParams = new URLSearchParams(hashQuery);
+      t = hashParams.get("id") || hashParams.get("tableId") || hashParams.get("table");
+      if (t) return t;
+    }
+
+    // 3) common path patterns: /table/123 or /t/123 or /tables/123
+    const pathPatterns = [
+      /\/table\/(\d+)/i,
+      /\/t\/(\d+)/i,
+      /\/tables?\/(\d+)/i,
+      /\/(\d+)(?:$|[?#])/,
+    ];
+    for (const p of pathPatterns) {
+      const m = href.match(p);
+      if (m) return m[1];
+    }
+
+    // 4) fallback: search the whole href for id= param (non-numeric allowed)
+    const hrefMatch = href.match(/[?&]id=([^&#]+)/);
+    if (hrefMatch) return hrefMatch[1];
+
+    return null;
+  };
+
+  const getTableIdFromQRData = (qrData) => {
+    if (!qrData) return null;
+
+    try {
+      // If it's a direct number, return it
+      if (/^\d+$/.test(qrData.trim())) return qrData.trim();
+
+      // Try to parse as URL
+      const url = new URL(qrData);
+
+      // 1) standard search params
+      const searchParams = new URLSearchParams(url.search);
+      let t = searchParams.get("id") || searchParams.get("tableId") || searchParams.get("table");
+      if (t) return t;
+
+      // 2) hash-based routing where query is after '#'
+      const hash = url.hash || "";
+      const qm = hash.indexOf("?");
+      if (qm !== -1) {
+        const hashQuery = hash.substring(qm);
+        const hashParams = new URLSearchParams(hashQuery);
+        t = hashParams.get("id") || hashParams.get("tableId") || hashParams.get("table");
+        if (t) return t;
+      }
+
+      // 3) common path patterns: /table/123 or /t/123 or /tables/123
+      const pathPatterns = [
+        /\/table\/(\d+)/i,
+        /\/t\/(\d+)/i,
+        /\/tables?\/(\d+)/i,
+        /\/(\d+)(?:$|[?#])/,
+      ];
+      for (const p of pathPatterns) {
+        const m = url.pathname.match(p);
+        if (m) return m[1];
+      }
+
+      // 4) fallback: search the whole href for id= param (non-numeric allowed)
+      const hrefMatch = qrData.match(/[?&]id=([^&#]+)/);
+      if (hrefMatch) return hrefMatch[1];
+
+      return null;
+    } catch (e) {
+      // If not a valid URL, check if it's just a number
+      if (/^\d+$/.test(qrData.trim())) return qrData.trim();
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    // compute detected id for debug UI and decide action
+    let id = null;
+    try {
+      id = getTableIdFromUrl();
+      setDetectedId(id);
+    } catch (e) {
+      setDetectedId(null);
+    }
+
+    if (id) {
+      // auto-init when id present
+      initWithTableId(id);
+    } else {
+      // show UI to let user scan or enter table number
+      setNeedAction(true);
+    }
+
+    return () => {
+      stopScanner();
+    };
+  }, []);
+
+  const initOrder = async () => {
+    try {
+      const tableId = getTableIdFromUrl();
+
+      if (!tableId) {
+        setError("No table ID provided. Please scan a valid QR code.");
+        return;
+      }
+
+      setStatus("Setting up your table...");
+      
+      // Save table ID to localStorage
+      localStorage.setItem("id", tableId);
+
+      setStatus("Loading your order...");
+
+      // Always create a fresh order for this table to ensure unique OrderIds
+      try {
+        const addResp = await orderService.addOrder({ TableId: parseInt(tableId), SessionId: 0 });
+        let orderId = null;
+        if (addResp) {
+          orderId = addResp.OrderId || addResp.Result || addResp.orderId || (addResp.result && addResp.result.OrderId);
+        }
+        if (!orderId && addResp && typeof addResp === 'object' && addResp.status && addResp.OrderId) {
+          orderId = addResp.OrderId;
+        }
+        if (orderId) {
+          sessionManager.saveOrder(orderId);
+          console.log(`✅ New order created: OrderId: ${orderId}`, addResp);
+          setStatus("Order ready! Redirecting to menu...");
+          setTimeout(() => navigate("/menu"), 500);
+        } else {
+          console.error('Failed to create new order, response:', addResp);
+          setError("Failed to initialize order. Please try again.");
+        }
+      } catch (err) {
+        console.error('Failed to create order:', err);
+        setError("Failed to initialize order. Please try scanning the QR code again.");
+      }
+    } catch (err) {
+      console.error("Order init error:", err);
+      setError("Failed to initialize order. Please try scanning the QR code again.");
+    }
+  };
+
+  // Allow manual init when debugging: attempt to start using a provided id
+  const initWithTableId = async (manualId) => {
+    setError(null);
+    try {
+      if (!manualId) return setError("Please enter a table id to continue.");
+      localStorage.setItem("id", manualId);
+      // Always create a fresh order for the manually entered table id
+      try {
+        const addResp = await orderService.addOrder({ TableId: parseInt(manualId), SessionId: 0 });
+        let orderId = null;
+        if (addResp) {
+          orderId = addResp.OrderId || addResp.Result || addResp.orderId || (addResp.result && addResp.result.OrderId);
+        }
+        if (orderId) {
+          sessionManager.saveOrder(orderId);
+          setStatus("Order ready! Redirecting to menu...");
+          setTimeout(() => navigate("/menu"), 500);
+        } else {
+          console.error('Failed to create new order (manual), response:', addResp);
+          setError("Failed to initialize order. Please try again.");
+        }
+      } catch (err) {
+        console.error('Manual init create order failed:', err);
+        setError("Failed to initialize order. Please try again.");
+      }
+    } catch (err) {
+      console.error("Manual init error:", err);
+      setError("Failed to initialize order. Please try again.");
+    }
+  };
+
+  // Wrapper for manual enter to prevent duplicate submissions and show spinner
+  const handleManualEnter = async (id) => {
+    if (manualLoading) return; // prevent duplicate submissions
+    setError(null);
+    if (!id || String(id).trim() === "") return setError("Please enter a table id to continue.");
+    try {
+      setManualLoading(true);
+      await initWithTableId(id);
+    } finally {
+      setManualLoading(false);
+    }
+  };
+
+  // Scanner helpers using BarcodeDetector when available
+  const startScanner = async () => {
+    setScanMessage(null);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setScanMessage("Camera not available on this device.");
+      return;
+    }
+    try {
+      // Request stream first
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode } });
+
+      // Ensure video element is rendered and mounted
+      setShowScanner(true);
+
+      // wait for the video element to mount (with a small timeout)
+      const waitForVideo = async () => {
+        for (let i = 0; i < 20; i++) {
+          if (videoRef.current) return true;
+          // wait 50ms
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        return false;
+      };
+
+      const mounted = await waitForVideo();
+      if (!mounted) {
+        console.warn('Video element did not mount in time');
+      }
+
+      const video = videoRef.current;
+      if (video) {
+        try {
+          video.srcObject = stream;
+          // attempt to play; this may be blocked if browser denies autoplay
+          // eslint-disable-next-line no-await-in-loop
+          await video.play();
+        } catch (playErr) {
+          console.warn('Video play failed:', playErr);
+        }
+      }
+
+      setScanning(true);
+
+      // Use native BarcodeDetector if available, otherwise use jsQR fallback
+      const hasDetector = typeof window.BarcodeDetector !== 'undefined';
+
+      let detector = null;
+      try {
+        if (hasDetector) detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+      } catch (detErr) {
+        console.warn('BarcodeDetector initialization failed:', detErr);
+      }
+
+      // prepare a canvas for fallback decoding
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext && canvas.getContext('2d');
+
+      scanInterval.current = setInterval(async () => {
+        try {
+          const videoEl = videoRef.current;
+          if (!videoEl) return;
+
+          if (detector) {
+            const barcodes = await detector.detect(videoEl);
+            if (barcodes && barcodes.length > 0) {
+              const qrData = barcodes[0].rawValue;
+              const tableId = getTableIdFromQRData(qrData);
+              if (tableId) {
+                stopScanner();
+                setStatus('QR scanned. Initializing...');
+                initWithTableId(tableId);
+                return;
+              } else {
+                setScanMessage('Invalid QR code. Please scan a valid table QR code.');
+              }
+            }
+          } else if (ctx) {
+            // jsQR fallback: draw current frame and scan
+            const w = videoEl.videoWidth || videoEl.clientWidth;
+            const h = videoEl.videoHeight || videoEl.clientHeight;
+            if (w === 0 || h === 0) return; // not ready yet
+            canvas.width = w;
+            canvas.height = h;
+            ctx.drawImage(videoEl, 0, 0, w, h);
+            const imageData = ctx.getImageData(0, 0, w, h);
+            const code = jsQR(imageData.data, w, h);
+            if (code && code.data) {
+              const tableId = getTableIdFromQRData(code.data);
+              if (tableId) {
+                stopScanner();
+                setStatus('QR scanned. Initializing...');
+                initWithTableId(tableId);
+                return;
+              } else {
+                setScanMessage('Invalid QR code. Please scan a valid table QR code.');
+              }
+            }
+          }
+        } catch (dErr) {
+          console.error('Barcode detect error:', dErr);
+        }
+      }, 500);
+
+    } catch (err) {
+      console.error('Failed to start camera:', err);
+      // Provide more specific message based on error name
+      const name = err && err.name ? err.name : 'UnknownError';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setScanMessage('Camera permission denied. Please allow camera access in your browser settings.');
+      } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+        setScanMessage('No camera found on this device.');
+      } else {
+        setScanMessage('Failed to access camera. Please allow camera permission or enter table number manually.');
+      }
+    }
+  };
+
+  const toggleFacingMode = async () => {
+    const next = facingMode === 'environment' ? 'user' : 'environment';
+    setFacingMode(next);
+    // If currently scanning, restart scanner with new facingMode
+    if (scanning) {
+      stopScanner();
+      // small delay to ensure tracks are stopped
+      setTimeout(() => {
+        startScanner();
+      }, 200);
+    }
+  };
+
+  const stopScanner = () => {
+    try {
+      const video = videoRef.current;
+      if (video && video.srcObject) {
+        const tracks = video.srcObject.getTracks();
+        tracks.forEach((t) => t.stop());
+        video.srcObject = null;
+      }
+      if (scanInterval.current) {
+        clearInterval(scanInterval.current);
+        scanInterval.current = null;
+      }
+      setScanning(false);
+      setShowScanner(false);
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-teal-50 via-white to-cyan-50">
+        <Header
+          cartItemsCount={0}
+          onCartClick={() => {}}
+          onMenuToggle={() => {}}
+          showCart={false}
+        />
+        <div className="flex items-center justify-center min-h-[calc(100vh-64px)] p-4">
+          <div className="bg-white rounded-lg shadow-lg p-6 max-w-md w-full">
+            <div className="flex flex-col items-center justify-center py-8 text-center">
+              <AlertCircle className="w-16 h-16 text-red-400 mb-4" />
+              <h2 className="text-2xl font-bold text-gray-900 mb-2">{error || 'Error'}</h2>
+              <p className="text-gray-600 text-center mb-4">Please try scanning the QR code again or enter your table number manually.</p>
+
+              
+
+              <div className="flex space-x-3">
+                <button onClick={() => { setError(null); setNeedAction(true); setManualId(''); setDetectedId(null); }} className="px-6 py-2 bg-gradient-to-r from-[#18749b] to-teal-600 text-white rounded-lg hover:from-[#156285] hover:to-teal-700 transition-all">Try Again</button>
+                <button onClick={() => { localStorage.removeItem('id'); setError(null); setNeedAction(true); setDetectedId(null); }} className="px-6 py-2 bg-white border rounded">Reset</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (needAction && !error) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-teal-50 via-white to-cyan-50">
+        <Header cartItemsCount={0} onCartClick={() => {}} onMenuToggle={() => {}} showCart={false} />
+
+        <div className="flex items-center justify-center min-h-[calc(100vh-64px)] p-4">
+          <div className="bg-white rounded-lg shadow-lg p-6 max-w-2xl w-full">
+            <div className="text-center mb-6">
+              <QrCode className="w-14 h-14 text-gray-400 mx-auto mb-2" />
+              <h2 className="text-xl font-semibold text-gray-900">Scan QR or Enter Table Number</h2>
+              <p className="text-sm text-gray-600 mt-1">Start your order by scanning the table QR or entering the table number.</p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="p-4 rounded-lg border">
+                <h3 className="font-medium mb-2">Scan QR Code</h3>
+                {showScanner ? (
+                  <div>
+                    <video ref={videoRef} className="w-full h-56 bg-black rounded mb-2" />
+                    {scanMessage && <div className="text-sm text-red-600 mb-2">{scanMessage}</div>}
+                    <div className="flex gap-2">
+                      <button onClick={stopScanner} className="flex-1 px-4 py-2 bg-gray-100 rounded">Stop Scan</button>
+                      <button onClick={toggleFacingMode} className="flex-1 px-4 py-2 bg-gray-100 rounded">Switch Camera</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    {scanMessage && <div className="text-sm text-red-600 mb-2">{scanMessage}</div>}
+                    <div className="flex gap-2">
+                      <button onClick={startScanner} className="flex-1 px-4 py-2 bg-[#18749b] text-white rounded">Start Scan</button>
+                      <button onClick={() => setFacingMode(facingMode === 'environment' ? 'user' : 'environment')} className="flex-1 px-4 py-2 bg-gray-100 rounded">Use {facingMode === 'environment' ? 'Front' : 'Back'}</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="p-4 rounded-lg border">
+                <h3 className="font-medium mb-2">Enter Table Number</h3>
+                <div className="flex gap-2 items-center min-w-0">
+                  <input
+                    value={manualId}
+                    onChange={(e) => setManualId(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleManualEnter(manualId); } }}
+                    placeholder="e.g. 4"
+                    disabled={manualLoading}
+                    className={`flex-1 min-w-0 px-3 py-2 border rounded ${manualLoading ? 'opacity-60 cursor-not-allowed' : ''}`}
+                  />
+                  <button
+                    onClick={() => handleManualEnter(manualId)}
+                    disabled={manualLoading}
+                    className={`flex-shrink-0 whitespace-nowrap px-4 md:px-6 py-2 bg-[#18749b] text-white rounded flex items-center justify-center ${manualLoading ? 'opacity-60 cursor-not-allowed' : ''}`}
+                  >
+                    {manualLoading ? (
+                      <>
+                        <svg className="animate-spin -ml-1 mr-2 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                        </svg>
+                        Entering...
+                      </>
+                    ) : (
+                      'Enter'
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-teal-50 via-white to-cyan-50">
+      <Header
+        cartItemsCount={0}
+        onCartClick={() => {}}
+        onMenuToggle={() => {}}
+        showCart={false}
+      />
+      <div className="flex items-center justify-center min-h-[calc(100vh-64px)]">
+        <div className="text-center max-w-md p-8">
+          {/* Animated loading spinner */}
+          <div className="relative w-24 h-24 mx-auto mb-6">
+            <div className="absolute inset-0 border-4 border-[#18749b]/20 rounded-full"></div>
+            <div className="absolute inset-0 border-4 border-[#18749b] border-t-transparent rounded-full animate-spin"></div>
+            <div className="absolute inset-0 flex items-center justify-center">
+              <svg className="w-10 h-10 text-[#18749b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+              </svg>
+            </div>
+          </div>
+
+          <h2 className="text-2xl font-bold text-gray-900 mb-3">{status}</h2>
+          <p className="text-gray-600 leading-relaxed">
+            Please wait while we prepare your dining experience.
+          </p>
+
+          {/* Progress dots */}
+          <div className="flex justify-center space-x-2 mt-6">
+            <div className="w-2 h-2 bg-[#18749b] rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
+            <div className="w-2 h-2 bg-[#18749b] rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
+            <div className="w-2 h-2 bg-[#18749b] rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default QRLandingPage;
